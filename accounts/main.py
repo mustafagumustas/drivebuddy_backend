@@ -1,4 +1,4 @@
-from langchain.agents import AgentExecutor, create_tool_calling_agent 
+from langchain.agents import AgentExecutor, create_tool_calling_agent
 
 from langchain_core.tools import tool
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
@@ -14,16 +14,25 @@ from mem0 import Memory
 import spotipy
 import dotenv
 import os
-from pydantic import BaseModel, ConfigDict
+import base64
+from io import BytesIO
+from pydub import AudioSegment
+from django.conf import settings
+from django.http import JsonResponse
+
+
+from pydantic import ConfigDict
+from openai import OpenAI
+import io
 
 from music_manager import play_track_on_device
 from accounts.voice_activity_detection import SpeechRecorder
 
-from pydub import AudioSegment
-import io
-from django.http import HttpResponse
 
 llm = ChatOpenAI(model="gpt-4o-mini")
+
+client = OpenAI()
+
 drive_buddy_main_prompt = """You are a drive buddy application for drivers, a co-pilot.
 It's a GPT that accompanies people who are driving, like a live radio.
 
@@ -95,6 +104,7 @@ config = {
 mem0 = Memory.from_config(config)
 memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
 
+
 # Define the State
 class State(TypedDict):
     messages: Annotated[List[HumanMessage | AIMessage], add_messages]
@@ -102,9 +112,11 @@ class State(TypedDict):
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
+
 graph = StateGraph(State)
 
 chat_history = []
+
 
 def transform_data(data):
     transformed = []
@@ -114,6 +126,7 @@ def transform_data(data):
         transformed.append(transformed_item)
     return transformed
 
+
 def chatbot(state: State):
     messages = state["messages"]
     user_id = state["mem0_user_id"]
@@ -122,12 +135,12 @@ def chatbot(state: State):
     # Retrieve relevant memories
     memories = mem0.search(messages[-1].content, user_id=user_id, limit=5)
     context = "Relevant information from previous conversations:\n"
-    if memories['entities']:
+    if memories["entities"]:
         context += "Entities:\n"
         context += f"{transform_data(memories['entities'])}"
-    if memories['memories']:
+    if memories["memories"]:
         context += "Memories:\n"
-        for memory in memories['memories']:
+        for memory in memories["memories"]:
             context += f"- {memory['memory']}\n"
 
     prompt = ChatPromptTemplate.from_messages(
@@ -150,47 +163,67 @@ def chatbot(state: State):
         }
     )
     chat_history.append(AIMessage(response["output"]))
-    mem0.add(f"User: {messages[-1].content}\nAssistant: {response["output"]}",
-              user_id=user_id)
+    mem0.add(
+        f"User: {messages[-1].content}\nAssistant: {response["output"]}",
+        user_id=user_id,
+    )
     return {"messages": [AIMessage(content=response["output"])]}
+
 
 graph.add_node("chatbot", chatbot)
 graph.add_edge(START, "chatbot")
 graph.add_edge("chatbot", "chatbot")
 compiled_graph = graph.compile()
 
-def run_conversation(user_input: str, mem0_user_id: str, recorder):
-    configg = {"configurable": {"thread_id": mem0_user_id}}    
-    state = {
-        "messages": [HumanMessage(content=user_input)],
-        "mem0_user_id": mem0_user_id,
-    }
 
-    for event in compiled_graph.stream(state, configg):
-        for value in event.values():
-            if value.get("messages"):
-                recorder.gpt_speech(value["messages"][-1].content)
-                return  # Exit after printing the response
-
-def main_loop(mem0_user_id, first_run):
+def run_conversation(mem0_user_id: str, first_run: bool, audio_base64: str = None):
     first_run = first_run
-    while True:
-        call_from_main(mem0_user_id, first_run)
-        first_run = False  # Set to False after the first run
-
-# main.py
-def call_from_main(mem0_user_id, first_run):
-    print("main called")
-    recorder = SpeechRecorder()
     try:
         if first_run:
             print("this is the first run")
-            user_info = mem0.search(f"who is {mem0_user_id}", user_id=mem0_user_id, limit=5)
-            text = f"""Hello this is {mem0_user_id}. Please greet me using this info: {transform_data(user_info["entities"][:10])}"""
+            user_info = mem0.search(
+                f"who is {mem0_user_id}", user_id=mem0_user_id, limit=5
+            )
+            user_input = f"""Hello this is {mem0_user_id}. Please greet me using this info: {transform_data(user_info["entities"][:10])}"""
         else:
             print("this is the not the first run")
-            text = recorder.record()
-        run_conversation(text, mem0_user_id, recorder)
+            if audio_base64:
+                # Decode base64 to audio
+                audio_data = base64.b64decode(audio_base64)
+                audio_io = BytesIO(audio_data)
+
+                # Use pydub to handle audio data as needed
+                audio_segment = AudioSegment.from_file(audio_io, format="wav")
+
+                # Process audio_segment as required for your application
+                user_input = "Processed audio input"  # Replace with the actual transcription or further processing
+            else:
+                user_input = "No audio input provided"
+
+        config = {"configurable": {"thread_id": mem0_user_id}}
+        state = {
+            "messages": [HumanMessage(content=user_input)],
+            "mem0_user_id": mem0_user_id,
+        }
+
+        for event in compiled_graph.stream(state, config):
+            for value in event.values():
+                if value.get("messages"):
+                    response_text = value["messages"][-1].content
+                    return response_text
+        return response_text
     finally:
-        print("closing the recorder")
-        recorder.close()
+        return response_text
+
+
+def gpt_speech(gpt_response_text):
+    with client.audio.speech.with_streaming_response.create(
+        model="tts-1", voice="alloy", input=gpt_response_text
+    ) as response:
+        audio_data = response.read()
+        # Save the MP3 file on the server
+        audio_path = os.path.join(settings.MEDIA_ROOT, "speech.mp3")
+        with open(audio_path, "wb") as audio_file:
+            audio_file.write(response["data"])
+
+    return audio_path

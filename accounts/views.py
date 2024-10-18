@@ -1,5 +1,5 @@
 from django.contrib.auth import get_user_model, authenticate
-from accounts.voice_activity_detection import SpeechRecorder
+
 from .serializers import UsersSerializer, SignInSerializer
 from rest_framework.permissions import AllowAny
 from rest_framework.decorators import api_view
@@ -8,16 +8,18 @@ from rest_framework import generics, status
 from django.contrib.auth.models import User
 from rest_framework import permissions
 from django.http import JsonResponse
-from accounts.main import main_loop, return_text
-from threading import Thread
-from mem0 import Memory
+from accounts.main import run_conversation, gpt_speech
 import logging
 import dotenv
 import os
-from django.conf import settings
-from pydub import AudioSegment
-import io
-from django.http import HttpResponse
+
+from openai import OpenAI
+from django.views.decorators.csrf import csrf_exempt
+from django.http import FileResponse
+import tempfile
+
+
+client = OpenAI()
 
 User = get_user_model()
 
@@ -82,6 +84,35 @@ def start_conversation(request):
     print("Reached start_conversation")
     mem0_user_id = "mustafa_gumustas"
     first_run = request.data.get("first_run", True)
-    conversation_thread = Thread(target=main_loop)
-    conversation_thread.start()
-    return JsonResponse({"message": "Conversation loop started."})
+    audio_base64 = request.data.get("audio_base64")
+    conversation = run_conversation(mem0_user_id, first_run, audio_base64=audio_base64)
+    return JsonResponse({"text": conversation})
+
+
+@csrf_exempt
+def generate_speech(request):
+    text = request.POST.get("text")
+    print("Received text:", text)  # Log the text received from the frontend
+    if not text:
+        return JsonResponse({"error": "No text provided"}, status=400)
+
+    try:
+        # Generate TTS and save to a temporary file
+        with client.audio.speech.create(
+            model="tts-1", voice="alloy", input=text
+        ) as response:
+            # Create a temporary file and write the response content
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as temp_file:
+                temp_file.write(response.content)
+                temp_file_path = temp_file.name
+
+        # Serve the temporary file as a FileResponse
+        return FileResponse(open(temp_file_path, "rb"), content_type="audio/mpeg")
+
+    except Exception as e:
+        print("Error generating TTS:", str(e))
+        return JsonResponse({"error": "Failed to generate speech"}, status=500)
+    finally:
+        # Optional: Cleanup the temporary file after serving
+        if temp_file_path and os.path.exists(temp_file_path):
+            os.remove(temp_file_path)

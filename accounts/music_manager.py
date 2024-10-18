@@ -8,7 +8,7 @@ import spotipy
 import dotenv
 import os
 
-load_status = dotenv.load_dotenv("Neo4j-c95d3ee9-Created-2024-09-01.txt")
+load_status = dotenv.load_dotenv("accounts/variables.txt")
 client_id = os.getenv("SPO_CLIENT_ID")
 client_secret = os.getenv("SPO_CLIENT_SECRET")
 
